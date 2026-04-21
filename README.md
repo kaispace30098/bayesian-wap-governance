@@ -2,7 +2,7 @@
 
 A two-stage CI/CD validation architecture for high-volume, low-frequency administrative data systems in regulated environments.
 
-![Architecture Overview](diagrams/architecture_overview.png)
+![Architecture Overview](diagram/architecture_overview.png)
 
 ## Overview
 
