@@ -8,65 +8,39 @@ This prototype demonstrates the same Bayesian WAP governance architecture descri
 
 ## Architecture
 
-**Components: 2 producers, 3 Kafka topics, 2 consumers**
-
 ```
-PRODUCERS (2):
-  Both pumps send to BOTH input topics.
-  Each pump has 2 sensors (vibration + temperature).
-
-  Producer 1 (pump-042) ──┬── send vibration    ──→ topic-vibration
-                          └── send temperature  ──→ topic-temperature
-
-  Producer 2 (pump-099) ──┬── send vibration    ──→ topic-vibration
-                          └── send temperature  ──→ topic-temperature
-
-KAFKA TOPICS (3):
-  topic-vibration    ← all vibration readings from all pumps
-  topic-temperature  ← all temperature readings from all pumps
-  topic-alerts       ← only anomalies (YELLOW/RED), written by Consumer 1
-
-CONSUMERS (2):
-
-  Consumer 1: bayesian-scorer (consumer_scorer.py)
-    Subscribes to: topic-vibration AND topic-temperature
-    Also acts as PRODUCER: writes anomalies to topic-alerts
-    ├── 4 independent NIG scorers (2 devices × 2 sensors)
-    ├── Each reading: score against posterior predictive distribution
-    ├── All readings logged to DuckDB (scoring_log table)
-    ├── score > 3.0 (YELLOW) or > 4.0 (RED):
-    │     → write to topic-alerts
-    │     → INSERT into alerts table with override_status = 'PENDING'
-    ├── Check DuckDB for HITL override before updating prior
-    └── Normal readings → log only, no alert
-
-  Consumer 2: streamlit-hitl (app.py)
-    Subscribes to: topic-alerts only
-    ├── Displays pending alerts (RED first, then YELLOW)
-    ├── 4-state HITL override buttons per alert:
-    │     IGNORE_ANOMALY, REGIME_CHANGE,
-    │     ACKNOWLEDGED_OUTLIER, TRANSITION_STATE
-    ├── Writes override decisions to DuckDB (scorer reads them)
-    ├── Device health score trend chart (Plotly)
-    └── Override audit log table
-
-DATA FLOW:
-
-  pump-042 ─┐                                    ┌─→ topic-alerts
-  pump-099 ─┤                                    │        │
-            ▼                                    │        ▼
-  topic-vibration ──→ Consumer 1 ──→ score ──→ RED? ──┘  Consumer 2
-  topic-temperature ─┘ (Bayesian     log to      │       (Streamlit)
-                        scorer)      DuckDB      │        │
-                          ▲                      │        ▼
-                          │                      │    HITL override
-                          └──── read overrides ──┘    written to
-                                from DuckDB           DuckDB
-
-PERSISTENCE:
-  DuckDB (sensor.duckdb) — shared volume between scorer and dashboard
-    ├── scoring_log table (ALL readings with scores and prior params)
-    └── alerts table (anomalies + HITL override status + audit trail)
+sensor-simulator (producer.py)
+  ├── pump-042: vibration + temperature → every 1s
+  └── pump-099: vibration + temperature → every 1s
+         │                    │
+         ▼                    ▼
+   topic-vibration      topic-temperature
+         │                    │
+         └────────┬───────────┘
+                  ▼
+    bayesian-scorer (consumer_scorer.py)
+      ├── 4 independent NIG scorers (2 devices × 2 sensors)
+      ├── Each reading: score against posterior → update prior
+      ├── All readings logged to DuckDB (scoring_log table)
+      ├── score > 3.0 (YELLOW) or > 4.0 (RED) → write to topic-alerts
+      └── Normal → log only, no alert
+                  │
+                  ▼
+           topic-alerts
+                  │
+                  ▼
+    streamlit-hitl (app.py)
+      ├── Reads topic-alerts on startup, then polls
+      ├── Displays pending alerts (RED first, then YELLOW)
+      ├── 4-state HITL override buttons per alert:
+      │     IGNORE_ANOMALY, REGIME_CHANGE,
+      │     ACKNOWLEDGED_OUTLIER, TRANSITION_STATE
+      ├── Device health score trend chart (Plotly)
+      └── Override audit log table
+                  │
+            DuckDB (sensor.duckdb)
+              ├── scoring_log table (all readings)
+              └── alerts table (anomalies + override status)
 ```
 
 ## Tech Stack
@@ -102,7 +76,7 @@ streaming-prototype/
 ├── dashboard/
 │   ├── Dockerfile
 │   ├── app.py                  # Streamlit HITL dashboard
-│   └── requirements.txt        # streamlit, duckdb, plotly, kafka-python
+│   └── requirements.txt        # streamlit, duckdb, plotly, pandas
 ```
 
 ## File Specifications
@@ -180,10 +154,12 @@ On startup:
   1. Initialize DuckDB at DB_PATH (env var, default: ./sensor.duckdb)
   2. Create tables if not exist (call init_db.py)
   3. Create 4 BayesianAnomalyDetector instances:
-     - ("pump-042", "vibration"):   mu0=0.5, nu0=10, alpha0=5, beta0=0.5
-     - ("pump-042", "temperature"): mu0=85,  nu0=10, alpha0=5, beta0=10
-     - ("pump-099", "vibration"):   mu0=0.3, nu0=10, alpha0=5, beta0=0.3
-     - ("pump-099", "temperature"): mu0=82,  nu0=10, alpha0=5, beta0=8
+     - ("pump-042", "vibration"):   mu0=0.5, nu0=10, alpha0=5, beta0=0.05
+     - ("pump-042", "temperature"): mu0=85,  nu0=10, alpha0=5, beta0=18.0
+     - ("pump-099", "vibration"):   mu0=0.3, nu0=10, alpha0=5, beta0=0.03
+     - ("pump-099", "temperature"): mu0=82,  nu0=10, alpha0=5, beta0=10.0
+     Note: beta0 calibrated so prior predictive scale ≈ sensor's natural std dev.
+     Formula: beta0 = sigma² × alpha0 × nu0 / (nu0 + 1)
 
 For each message:
   1. Parse JSON
@@ -228,9 +204,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     score DOUBLE,
     level VARCHAR,
     override_status VARCHAR DEFAULT 'PENDING',
-    override_by VARCHAR,
-    override_ts TIMESTAMP,
-    override_note VARCHAR
+    override_by     VARCHAR,
+    override_ts     TIMESTAMP,
+    override_note   VARCHAR,
+    prior_applied   BOOLEAN DEFAULT FALSE
 );
 ```
 
@@ -405,21 +382,31 @@ The equipment is undergoing a planned temporary fluctuation (startup, shutdown, 
 
 ### Implementation note
 
-The override is applied AFTER scoring but controls whether the NEXT prior update happens. The scorer always scores the reading first (so the score is logged), then checks DuckDB for any override on that (device_id, sensor_type) before deciding whether to call `scorer.update(x)`.
+Override decisions are applied by a **background thread** (`override_applier`) that polls the `alerts` table every 2 seconds for rows where `override_status != 'PENDING'` and `prior_applied = FALSE`. The main Kafka consumer loop does not block waiting for operator input.
+
+The prior update is **deferred** for anomalous readings and applied retroactively once the operator decides:
 
 ```python
-# Pseudocode in consumer_scorer.py
-score = scorer.score(value)          # Always score first
-log_to_duckdb(score, level, ...)     # Always log
+# Pseudocode in consumer_scorer.py — main consumer loop
+score = scorer.score(value)       # Always score
+log_to_scoring_log(...)           # Always log
 
-override = check_override(device_id, sensor_type)  # Check DuckDB
+if level == "NORMAL":
+    scorer.update(value)          # Immediate update — no override needed
+else:  # YELLOW or RED
+    insert_alert(override_status='PENDING', prior_applied=False)
+    send_to_topic_alerts(...)
+    # Prior update deferred — override_applier thread handles it
 
-if override == "IGNORE_ANOMALY" or override == "ACKNOWLEDGED_OUTLIER":
-    pass  # Do NOT update prior
-elif override == "REGIME_CHANGE":
-    scorer.reset(initial_params)  # Reset prior to initial values
-else:
-    scorer.update(value)  # Normal update (includes TRANSITION_STATE)
+# --- override_applier thread (runs every 2 s) ---
+for alert in alerts where override_status != 'PENDING' and prior_applied = False:
+    if alert.override in ("IGNORE_ANOMALY", "ACKNOWLEDGED_OUTLIER"):
+        pass                      # Skip update — don't pollute prior
+    elif alert.override == "TRANSITION_STATE":
+        scorer.update(alert.raw_value)   # Apply deferred update
+    elif alert.override == "REGIME_CHANGE":
+        scorer.reset()            # Restore (mu0, nu0, alpha0, beta0) to initial values
+    mark prior_applied = True
 ```
 
 ## Key Design Decisions
